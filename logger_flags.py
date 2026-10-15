@@ -59,7 +59,7 @@ OVERFLOW_LAYER = (
     "United_Utilities_Storm_Overflow_Activity/FeatureServer/0"
 )
 BBOX = "-3.03,54.32,-2.93,54.40"
-WATERCOURSES = {"cunsey beck", "black beck"}
+WATERCOURSES = {"cunsey beck", "black beck", "lake windermere"}
 
 RAIN_URL = (
     "https://api.open-meteo.com/v1/forecast?latitude=54.35&longitude=-2.983"

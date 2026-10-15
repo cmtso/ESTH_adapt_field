@@ -1,4 +1,4 @@
-# Adaptive sampling – Cunsey Beck / Windermere
+# Adaptive sampling – Esthwaite
 
 This setup changes how often the **SUNA nitrate sensor** is read, based on conditions at the site and on outside information (rain forecasts and storm overflow activity). The thermistor string is always read every 15 min.
 
@@ -11,6 +11,15 @@ There are two parts:
 
 The logger works without the PC. If the PC stops, Rules 1–4 carry on, and the rain and overflow sampling switches itself off after 6 h.
 
+- `logger_flags_state.json` is an example output file of `logger_flags.py`, which stores the latest value of `RainFlag`, `OverflowFlag` and `Heartbeat`.
+- `cunsey_beck_app.py` is a very simple streamlit app demonstrating the retreival of live rainfall prediction and UU storm overflow data using application programming interfaces (API) calls. 
+
+
+*Disclaimer: this project uses AI-assisted development tools. Human review all output. The authors are solely responsible for the content and fitness-of-purpose of this project.*
+
+*Claude Code (Anthropic) `claude-opus-4-8`* Agentic mode was not used.
+
+*Currenlty, the logger programme (*.cr1x) is not ready for deployment.*
 ---
 
 ## 1. Sampling rules
@@ -28,8 +37,8 @@ When more than one rule is active, the SUNA is read at the fastest interval any 
 
 | Rule | Set by | Condition | SUNA reading | Rule table |
 |---|---|---|---|---|
-| **Rain** | `logger_flags.py` | ≥ 5 mm of rain forecast in the next 24 h (Open-Meteo, ECMWF model) | every **5 min** while on | `RainFast` |
-| **Overflow** | `logger_flags.py` | A United Utilities storm overflow on Cunsey Beck / Black Beck is discharging, or has stopped within the last 24 h | every **1 min** while on | `OverflowFast` |
+| **Rain** | `logger_flags.py` | ≥ 5 mm of rain forecast in the next 24 h (ECMWF model available at Open-Meteo API) | every **5 min** while on | `RainFast` |
+| **Overflow** | `logger_flags.py` | A United Utilities storm overflow on Cunsey Beck / Black Beck / Windermere Shore is discharging, or has stopped within the last 24 h | every **1 min** while on | `OverflowFast` |
 | **1 – Sudden change** | logger | The change in `SUNA_Nitrate_mgL` since the previous reading is more than **3 × the SD of all nitrate readings up to the previous one** (needs 30 readings first) | every **10 min** for **3 h**; each new big change restarts the 3 h | `Rule1Fast` |
 | **2 – Rising nitrate** | logger, checked hourly | Mean nitrate over the last 0–24 h > mean over 24–48 h ago (based on hourly means) | every **30 min** while true | `Rule2Fast` |
 | **3 – Warm / bright** | logger, checked every 15 min | `Temp4m` > 18 °C **OR** `SPFD` > 800 | **one** reading, at most once every **6 h** | `Rule3Event` |
