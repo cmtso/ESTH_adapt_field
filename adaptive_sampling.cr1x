@@ -1,0 +1,347 @@
+'CR1000X / CR6 series - adaptive sampling sketch
+'Two flags set remotely by logger_flags.py, both of which control the SUNA:
+'  RainFlag     -> SUNA every 5 min (RainFast table) while rain is forecast
+'  OverflowFlag -> SUNA every 1 min (OverflowFast table) while a storm overflow is active
+'Four rules worked out on the logger itself, which also control the SUNA:
+'  Rule 1 (R1Flag) -> SUNA every 10 min for 3 h after a sudden nitrate change
+'  Rule 2 (R2Flag) -> SUNA every 30 min while the last 24 h nitrate mean is higher
+'                     than the mean for 24-48 h ago
+'  Rule 3 (R3Fire) -> one SUNA reading, at most every 6 h, warm water at 4 m or strong sun
+'  Rule 4 (R4Fire) -> one SUNA reading, at most every 6 h, windy and 1 m water cooling
+'Every SUNA reading goes in the SUNA table; each rule also has its own table.
+'Thermistors are read every 15 min for the Normal table, whatever the flags say.
+'The Normal table always records. Replace the measurement sections with
+'your own sensor code, then compile in CRBasic Editor.
+'Lines marked <<< CHECK are placeholders: confirm names, indices and wiring.
+
+Const NumDepths = 6              'number of temperature sensors
+Const ScanSecs = 10              'scan interval in seconds
+Const TimeoutSecs = 21600        '6 h without a heartbeat -> both flags off
+Const SUNABaseMins = 60          '<<< CHECK: routine SUNA interval when no rule is active (must be <= 60)
+
+'--- Adaptive rule settings ---
+Const R1Mult = 3                 'Rule 1: change > R1Mult x SD
+Const R1MinN = 30                'Rule 1: SUNA readings needed before the SD is trusted
+Const R1HoldSecs = 10800         'Rule 1: stays on 3 h after the LAST exceedance (each new one restarts the 3 h)
+Const R2RecentHrs = 24           'Rule 2: recent window, hours 0-24 back
+Const R2OlderEndHrs = 48         '<<< CHECK: Rule 2 older window, hours 24-48 back
+Const R2Thresh = 0               'Rule 2: recent mean minus older mean must exceed this
+Const R3TempMax = 18             'Rule 3: water temperature at 4 m, degC
+Const R3SolarMax = 800           'Rule 3: solar radiation threshold applied to SPFD
+'<<< CHECK: the name SPFD suggests photon flux (umol m-2 s-1), not W m-2.
+'           If so, 800 W m-2 is roughly 1600-1800 umol m-2 s-1: change R3SolarMax.
+Const R4WindMin = 2.5            'Rule 4: 6 h mean wind speed, m/s
+Const R4TempDrop = 0.2           'Rule 4: fall in 1 m water temperature over 6 h, degC
+Const RuleRepeatSecs = 21600     'Rules 3 and 4: at most one trigger every 6 h
+Const NumHrs = R2OlderEndHrs     'hourly means kept for Rules 2 and 4 (must be >= 7)
+
+'--- set remotely via the web API (SetValueEx) ---
+Public RainFlag As Boolean
+Public OverflowFlag As Boolean
+Public Heartbeat As Long
+
+'--- worked out by the logger ---
+Public SecsSinceHB As Long
+Public BattV
+Public Temp(NumDepths)
+Public WindSpd                   '<<< CHECK: wind speed variable name (m/s)
+Public SPFD                      '<<< CHECK: solar radiation; declare once only if your program already has it
+Public Temp1m                    '<<< CHECK: water temperature at 1 m (degC); declare once only
+Public Temp4m                    '<<< CHECK: water temperature at 4 m (degC); declare once only
+Dim LastHeartbeat As Long
+Dim DoMeasure As Boolean
+Dim i As Long
+
+'--- SUNA (controlled by all four rules) ---
+Public SUNA_Nitrate_mgL          '<<< CHECK: SUNA nitrate (mg/L), tested by Rules 1 and 2; declare once only
+Public SUNA_Nitrate_uM           '<<< CHECK: placeholder SUNA variable
+Public SUNA_Abs254               '<<< CHECK: placeholder SUNA variable
+Public SUNA_Abs350               '<<< CHECK: placeholder SUNA variable
+Public SUNA_FitRMSE              '<<< CHECK: placeholder SUNA variable
+Public SUNA_DarkMean             '<<< CHECK: placeholder SUNA variable
+Dim DoSUNA As Boolean
+
+'--- Adaptive rule state ---
+Public R1Flag As Boolean
+Public R2Flag As Boolean
+Public R3Fire As Boolean
+Public R4Fire As Boolean
+Public R1Val                     'variable tested by Rule 1
+Public R2Val                     'variable tested by Rule 2
+Public R1Change, R1SD            'Rule 1 diagnostics
+Public R2MeanRecent, R2MeanOlder 'Rule 2 diagnostics
+Public T1Drop6h, Wind6h          'Rule 4 diagnostics
+Dim R1N As Long, R1Mean, R1M2, R1Prev, R1Delta
+Dim R1HoldLeft As Long
+Dim R3SecsSince As Long, R4SecsSince As Long
+'Hourly means, element 1 = most recent complete hour; HrN* = readings behind each mean
+Dim HrR2(NumHrs), HrT1(NumHrs), HrWS(NumHrs)
+Dim HrNR2(NumHrs) As Long, HrNT1(NumHrs) As Long, HrNWS(NumHrs) As Long
+Dim AccR2, AccT1, AccWS, AccNR2 As Long, AccNT1 As Long, AccNWS As Long
+Dim SumA, SumB, NA As Long, NB As Long
+
+'Routine record, always on
+DataTable (Normal, True, -1)
+  DataInterval (0, 15, Min, 10)
+  Sample (NumDepths, Temp(), FP2)   'Sample, not Average: sensors are read only at the interval
+  Minimum (1, BattV, FP2, False, False)
+  Sample (1, RainFlag, Boolean)
+  Sample (1, OverflowFlag, Boolean)
+  Sample (1, R1Flag, Boolean)
+  Sample (1, R2Flag, Boolean)
+  Average (1, WindSpd, FP2, False)
+  Average (1, SPFD, FP2, False)
+  Sample (1, Temp1m, FP2)
+  Sample (1, Temp4m, FP2)
+EndTable
+
+'Every SUNA reading, whichever rule (or the routine interval) asked for it
+DataTable (SUNA, DoSUNA, -1)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+  Sample (1, SUNA_Nitrate_uM, IEEE4)
+  Sample (1, SUNA_Abs254, IEEE4)
+  Sample (1, SUNA_Abs350, IEEE4)
+  Sample (1, SUNA_FitRMSE, IEEE4)
+  Sample (1, SUNA_DarkMean, IEEE4)
+  Sample (1, R1Flag, Boolean)
+  Sample (1, R2Flag, Boolean)
+  Sample (1, R3Fire, Boolean)
+  Sample (1, R4Fire, Boolean)
+  Sample (1, RainFlag, Boolean)
+  Sample (1, OverflowFlag, Boolean)
+EndTable
+
+'Rain forecast: records only while RainFlag is on
+DataTable (RainFast, RainFlag, -1)
+  DataInterval (0, 5, Min, 10)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+  Sample (1, SUNA_Nitrate_uM, IEEE4)   '<<< CHECK: placeholder SUNA variable
+EndTable
+
+'Storm overflow: records only while OverflowFlag is on
+DataTable (OverflowFast, OverflowFlag, -1)
+  DataInterval (0, 1, Min, 10)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+  Sample (1, SUNA_Nitrate_uM, IEEE4)   '<<< CHECK: placeholder SUNA variable
+EndTable
+
+'Rule 1: sudden nitrate change -> every 10 min
+DataTable (Rule1Fast, R1Flag, -1)
+  DataInterval (0, 10, Min, 10)
+  Sample (NumDepths, Temp(), FP2)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+  Sample (1, R1Change, IEEE4)
+  Sample (1, R1SD, IEEE4)
+EndTable
+
+'Rule 2: last 24 h nitrate mean above the 24-48 h mean -> every 30 min
+DataTable (Rule2Fast, R2Flag, -1)
+  DataInterval (0, 30, Min, 10)
+  Sample (NumDepths, Temp(), FP2)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+  Sample (1, R2MeanRecent, IEEE4)
+  Sample (1, R2MeanOlder, IEEE4)
+EndTable
+
+'Rule 3: T at 4 m > 18 degC OR SPFD > threshold -> one record, at most every 6 h
+DataTable (Rule3Event, R3Fire, 1000)
+  Sample (NumDepths, Temp(), FP2)
+  Sample (1, Temp4m, FP2)
+  Sample (1, SPFD, FP2)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+EndTable
+
+'Rule 4: 6 h mean wind > 2.5 m/s AND 1 m temperature down 0.2 degC in 6 h -> at most every 6 h
+DataTable (Rule4Event, R4Fire, 1000)
+  Sample (NumDepths, Temp(), FP2)
+  Sample (1, Wind6h, FP2)
+  Sample (1, T1Drop6h, FP2)
+  Sample (1, SUNA_Nitrate_mgL, IEEE4)
+EndTable
+
+'Power up and read the SUNA
+Sub MeasureSUNA
+  '<<< CHECK: replace with your own SUNA code, e.g. switch power, wait for warm-up, read:
+  'SW12 (SW12_1, 1)
+  'SDI12Recorder (SUNAData(), C3, "1", "M!", 1.0, 0)
+  'SUNA_Nitrate_uM = SUNAData(1)
+  'SUNA_Nitrate_mgL = SUNAData(2)
+  '...
+  'SW12 (SW12_1, 0)
+  '<<< CHECK: if the SUNA warm-up is longer than ScanSecs, move this into a SlowSequence
+EndSub
+
+BeginProg
+  'Let Rules 3 and 4 fire as soon as their condition is first met
+  R3SecsSince = RuleRepeatSecs
+  R4SecsSince = RuleRepeatSecs
+
+  Scan (ScanSecs, Sec, 0, 0)
+    Battery (BattV)
+    R3Fire = False
+    R4Fire = False
+
+    'Watchdog: if the PC stops checking in, fall back to normal sampling
+    If Heartbeat <> LastHeartbeat Then
+      LastHeartbeat = Heartbeat
+      SecsSinceHB = 0
+    Else
+      SecsSinceHB = SecsSinceHB + ScanSecs
+    EndIf
+    If SecsSinceHB > TimeoutSecs Then
+      RainFlag = False
+      OverflowFlag = False
+    EndIf
+
+    '=== met sensors, read every scan (cheap, and pulse counts need it) ===
+    '<<< CHECK: replace with your own anemometer / pyranometer code, e.g.
+    'PulseCount (WindSpd, 1, P1, 1, 1, 0.75, 0.2)
+    'VoltDiff (SPFD, 1, mV200, 1, True, 0, 60, 200, 0)
+
+    'Rule timers
+    If R1HoldLeft > 0 Then R1HoldLeft = R1HoldLeft - ScanSecs
+    R1Flag = (R1HoldLeft > 0)
+    If R3SecsSince < RuleRepeatSecs Then R3SecsSince = R3SecsSince + ScanSecs
+    If R4SecsSince < RuleRepeatSecs Then R4SecsSince = R4SecsSince + ScanSecs
+
+    'Top of each hour: close the hour just ended, then evaluate Rules 2 and 4.
+    'Readings taken later in this scan count towards the new hour.
+    If TimeIntoInterval (0, 60, Min) Then
+      For i = NumHrs To 2 Step -1
+        HrR2(i) = HrR2(i - 1)
+        HrT1(i) = HrT1(i - 1)
+        HrWS(i) = HrWS(i - 1)
+        HrNR2(i) = HrNR2(i - 1)
+        HrNT1(i) = HrNT1(i - 1)
+        HrNWS(i) = HrNWS(i - 1)
+      Next i
+      HrNR2(1) = AccNR2
+      HrNT1(1) = AccNT1
+      HrNWS(1) = AccNWS
+      If AccNR2 > 0 Then HrR2(1) = AccR2 / AccNR2
+      If AccNT1 > 0 Then HrT1(1) = AccT1 / AccNT1
+      If AccNWS > 0 Then HrWS(1) = AccWS / AccNWS
+      AccR2 = 0
+      AccNR2 = 0
+      AccT1 = 0
+      AccNT1 = 0
+      AccWS = 0
+      AccNWS = 0
+
+      'Rule 2: nitrate mean for hours 0-24 back against hours 24-48 back
+      SumA = 0
+      NA = 0
+      SumB = 0
+      NB = 0
+      For i = 1 To R2RecentHrs
+        If HrNR2(i) > 0 Then
+          SumA = SumA + HrR2(i)
+          NA = NA + 1
+        EndIf
+      Next i
+      For i = R2RecentHrs + 1 To R2OlderEndHrs
+        If HrNR2(i) > 0 Then
+          SumB = SumB + HrR2(i)
+          NB = NB + 1
+        EndIf
+      Next i
+      'Need at least half of each window, so it stays off for the first ~36 h
+      If NA * 2 >= R2RecentHrs AND NB * 2 >= R2OlderEndHrs - R2RecentHrs Then
+        R2MeanRecent = SumA / NA
+        R2MeanOlder = SumB / NB
+        R2Flag = (R2MeanRecent - R2MeanOlder > R2Thresh)
+      Else
+        R2Flag = False
+      EndIf
+
+      'Rule 4: 6 h mean wind and the fall in 1 m temperature over 6 h
+      'Hour 1 (just ended) is compared with hour 7 (the hour ending 6 h earlier)
+      SumA = 0
+      NA = 0
+      For i = 1 To 6
+        If HrNWS(i) > 0 Then
+          SumA = SumA + HrWS(i)
+          NA = NA + 1
+        EndIf
+      Next i
+      If NA = 6 AND HrNT1(1) > 0 AND HrNT1(7) > 0 Then
+        Wind6h = SumA / NA
+        T1Drop6h = HrT1(7) - HrT1(1)
+        If Wind6h > R4WindMin AND T1Drop6h >= R4TempDrop AND R4SecsSince >= RuleRepeatSecs Then
+          R4Fire = True
+          R4SecsSince = 0
+          '<<< CHECK: add any other action here, e.g. PulsePort (C2, 100000) to start an autosampler
+        EndIf
+      EndIf
+    EndIf
+
+    AccWS = AccWS + WindSpd
+    AccNWS = AccNWS + 1
+
+    'Only power up the sensors as often as the fastest active table needs
+    DoMeasure = TimeIntoInterval (0, 15, Min)
+    If R1Flag Then DoMeasure = DoMeasure OR TimeIntoInterval (0, 10, Min)
+    If R2Flag Then DoMeasure = DoMeasure OR TimeIntoInterval (0, 30, Min)
+
+    If DoMeasure Then
+      '=== replace with your own measurements, e.g. SDI12Recorder(...) ===
+      'SDI12Recorder (Temp(), C1, "0", "M!", 1.0, 0)
+      '<<< CHECK: Temp1m and Temp4m must be measured here (or earlier in the scan)
+
+      'Rule 3: warm water at 4 m or strong sun, no more than once per 6 h
+      If (Temp4m > R3TempMax OR SPFD > R3SolarMax) AND R3SecsSince >= RuleRepeatSecs Then
+        R3Fire = True
+        R3SecsSince = 0
+        '<<< CHECK: add any other action here, e.g. PulsePort (C2, 100000) to start an autosampler
+      EndIf
+
+      AccT1 = AccT1 + Temp1m
+      AccNT1 = AccNT1 + 1
+    EndIf
+
+    'SUNA: routine interval, faster while RainFlag / OverflowFlag / Rules 1 / 2 are on,
+    'and once whenever Rule 3 / 4 fires
+    DoSUNA = TimeIntoInterval (0, SUNABaseMins, Min)
+    If RainFlag Then DoSUNA = DoSUNA OR TimeIntoInterval (0, 5, Min)
+    If OverflowFlag Then DoSUNA = DoSUNA OR TimeIntoInterval (0, 1, Min)   '<<< CHECK: SUNA must finish a reading in < 1 min
+    If R1Flag Then DoSUNA = DoSUNA OR TimeIntoInterval (0, 10, Min)
+    If R2Flag Then DoSUNA = DoSUNA OR TimeIntoInterval (0, 30, Min)
+    DoSUNA = DoSUNA OR R3Fire OR R4Fire
+
+    If DoSUNA Then
+      Call MeasureSUNA
+
+      R1Val = SUNA_Nitrate_mgL   '<<< CHECK: Rule 1 tests SUNA nitrate
+      R2Val = SUNA_Nitrate_mgL   '<<< CHECK: Rule 2 tests SUNA nitrate
+
+      'Rule 1: compare the change from the previous reading with 3 x the SD of all
+      'nitrate readings up to and including the previous one (the current reading is
+      'added to the SD only after the test).
+      'Running mean / SD by Welford's method; restarts when the program restarts.
+      'Keeps evaluating while on: every new exceedance restarts the 3 h hold.
+      If R1N >= R1MinN Then
+        R1SD = Sqr (R1M2 / (R1N - 1))
+        R1Change = Abs (R1Val - R1Prev)
+        If R1Change > R1Mult * R1SD Then R1HoldLeft = R1HoldSecs
+      EndIf
+      R1N = R1N + 1
+      R1Delta = R1Val - R1Mean
+      R1Mean = R1Mean + R1Delta / R1N
+      R1M2 = R1M2 + R1Delta * (R1Val - R1Mean)
+      R1Prev = R1Val
+      R1Flag = (R1HoldLeft > 0)
+
+      AccR2 = AccR2 + R2Val
+      AccNR2 = AccNR2 + 1
+    EndIf
+
+    CallTable Normal
+    CallTable SUNA
+    CallTable RainFast
+    CallTable OverflowFast
+    CallTable Rule1Fast
+    CallTable Rule2Fast
+    CallTable Rule3Event
+    CallTable Rule4Event
+  NextScan
+EndProg
